@@ -881,16 +881,9 @@ async function loadAuditList() {
     $("edgefix-result").className = "hidden-block";
     $("btn-edgefix").disabled = true;
   }
-  // 交付清单的可选入口包列表随审计选择联动加载
-  if ($("delivery-audit").value) {
-    await loadDeliveryPreview();
-  } else {
-    deliveryPackages = [];
-    $("delivery-entries").innerHTML = "";
-    $("delivery-result").className = "hidden-block";
-    $("btn-delivery").disabled = true;
-    $("btn-delivery-download").disabled = true;
-  }
+  // 交付清单：可选入口包列表随审计选择联动加载；
+  // loadDeliveryPreview 内部做请求代际隔离，清空选择时入口、旧清单与旧请求一并失效
+  await loadDeliveryPreview();
   return items;
 }
 
@@ -1714,9 +1707,20 @@ $("btn-graphselect").addEventListener("click", async () => {
 });
 
 // --- 交付清单（入口包闭包，只读） ------------------------------------------------
+//
+// 异步状态隔离：切换审计 / 重新加载入口 / 改变入口勾选都会进入新的“代际”，
+// 上一代的请求即便迟到也不能再改动入口列表、清单结果、错误提示与按钮状态。
+// 入口预览与清单生成各用一个单调递增的代际号；A→B→A 三个选择彼此隔离，
+// 旧请求结束（成功或失败）只会自行被丢弃，绝不解除新请求的加载状态。
 
 let deliveryPackages = [];  // 当前审计的可选入口包（预览接口返回）
 let deliveryNodeMap = {};   // 清单内节点 id -> 节点简要（渲染最短路径时标注许可证）
+let deliveryPreviewGen = 0; // 入口列表加载代际号（仅最新一代可写界面）
+let deliveryGen = 0;        // 当前选择代际号：切换审计/重载/改勾选都会递增
+let deliveryPreviewLoading = false; // 最新一代入口列表是否仍在加载
+let deliveryGenerating = false;     // 最新一代清单请求是否仍在进行
+let deliveryManifest = null;       // 当前审计 + 当前入口勾选下最后一次成功的清单
+let deliveryManifestText = "";     // 与所示清单字节一致的 JSON 文本（供下载）
 
 function showDeliveryAlert(msg) {
   const el = $("delivery-alert");
@@ -1725,28 +1729,70 @@ function showDeliveryAlert(msg) {
 }
 function clearDeliveryAlert() { $("delivery-alert").className = "alert"; }
 
+function invalidateDeliveryManifest() {
+  // 旧清单失效：隐藏结果、清空缓存与节点映射；下载按钮随同步逻辑禁用
+  deliveryManifest = null;
+  deliveryManifestText = "";
+  deliveryNodeMap = {};
+  const box = $("delivery-result");
+  box.className = "hidden-block";
+  box.innerHTML = "";
+}
+
+function syncDeliveryButtons() {
+  // 入口列表加载期间禁止生成和下载；
+  // 生成期间仅禁止再次生成；
+  // 下载仅在“当前审计 + 当前勾选”已有成功清单（即界面所示清单）时可用。
+  const hasEntries = selectedDeliveryEntries().length > 0;
+  $("btn-load-delivery").disabled = deliveryPreviewLoading;
+  $("btn-delivery").disabled =
+    deliveryPreviewLoading || deliveryGenerating || !hasEntries;
+  $("btn-delivery-download").disabled =
+    deliveryPreviewLoading || !deliveryManifest;
+}
+
 async function loadDeliveryPreview() {
-  clearDeliveryAlert();
   const aid = $("delivery-audit").value;
-  $("delivery-result").className = "hidden-block";
-  $("delivery-result").innerHTML = "";
-  $("btn-delivery").disabled = true;
-  $("btn-delivery-download").disabled = true;
+  // 新的一次入口加载：旧预览请求与旧清单/旧清单请求全部失效
+  const gen = ++deliveryPreviewGen;
+  deliveryGen = gen;
+  deliveryPreviewLoading = true;
+  deliveryGenerating = false;
+  clearDeliveryAlert();
+  invalidateDeliveryManifest();
+
+  const entriesBox = $("delivery-entries");
   if (!aid) {
-    $("delivery-entries").innerHTML = "";
+    deliveryPackages = [];
+    entriesBox.innerHTML = "";
+    deliveryPreviewLoading = false;
+    syncDeliveryButtons();
     return;
   }
+  // 加载期间清掉旧勾选并给出提示；生成/下载在同步前即保持禁用
+  entriesBox.innerHTML = '<p class="muted">正在加载可选入口包列表…</p>';
+  syncDeliveryButtons();
+
   let data;
   try {
     const resp = await fetch("/api/audits/" + aid + "/delivery");
     data = await resp.json();
     if (!resp.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
   } catch (e) {
+    // 仅最新一代可写界面；A 的迟到失败不能覆盖 B（含 A→B→A）
+    if (gen !== deliveryPreviewGen) return;
+    deliveryPackages = [];
+    entriesBox.innerHTML = "";
     showDeliveryAlert("加载包列表失败：" + e.message);
+    deliveryPreviewLoading = false;
+    syncDeliveryButtons();
     return;
   }
+  if (gen !== deliveryPreviewGen) return; // 已被切换审计/重新加载取代
   deliveryPackages = data.packages || [];
   renderDeliveryEntries();
+  deliveryPreviewLoading = false;
+  syncDeliveryButtons();
 }
 
 function renderDeliveryEntries() {
@@ -1771,10 +1817,9 @@ function selectedDeliveryEntries() {
   return Array.from(document.querySelectorAll(".delivery-check:checked")).map((c) => c.value);
 }
 
-function deliveryUrl(aid, entries, download) {
-  const params = entries.map((id) => "entry=" + encodeURIComponent(id));
-  if (download) params.push("download=true");
-  return "/api/audits/" + aid + "/delivery?" + params.join("&");
+function deliveryUrl(aid, entries) {
+  return "/api/audits/" + aid + "/delivery?" +
+    entries.map((id) => "entry=" + encodeURIComponent(id)).join("&");
 }
 
 function renderDeliveryPath(path) {
@@ -1861,38 +1906,65 @@ function renderDeliveryResult(data) {
 $("delivery-audit").addEventListener("change", loadDeliveryPreview);
 $("btn-load-delivery").addEventListener("click", loadDeliveryPreview);
 $("delivery-entries").addEventListener("change", () => {
-  const has = selectedDeliveryEntries().length > 0;
-  $("btn-delivery").disabled = !has;
-  $("btn-delivery-download").disabled = !has;
+  // 勾选变化即进入新代际：旧清单及其进行中的请求全部失效，
+  // 避免旧响应在新勾选下落盘、重新启用下载或改写结果。
+  ++deliveryGen;
+  deliveryGenerating = false;
+  clearDeliveryAlert();
+  invalidateDeliveryManifest();
+  syncDeliveryButtons();
 });
 $("btn-delivery").addEventListener("click", async () => {
-  clearDeliveryAlert();
   const aid = $("delivery-audit").value;
   if (!aid) { showDeliveryAlert("请先选择一条审计记录。"); return; }
   const entries = selectedDeliveryEntries();
   if (!entries.length) { showDeliveryAlert("请至少勾选一个交付入口包。"); return; }
-  $("btn-delivery").disabled = true;
+  // 本次生成成为当前选择下的最新请求；旧生成请求的迟到响应一律丢弃
+  const gen = ++deliveryGen;
+  deliveryGenerating = true;
+  clearDeliveryAlert();
+  invalidateDeliveryManifest();
+  syncDeliveryButtons();
+
+  let data;
   try {
-    const resp = await fetch(deliveryUrl(aid, entries, false));
-    const data = await resp.json();
-    if (!resp.ok) {
-      showDeliveryAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
-      return;
-    }
-    renderDeliveryResult(data);
+    const resp = await fetch(deliveryUrl(aid, entries));
+    data = await resp.json();
+    if (!resp.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
   } catch (e) {
+    if (gen !== deliveryGen) return; // 已被切换/重载/改勾选取代，不解除新请求的加载态
+    deliveryGenerating = false;
     showDeliveryAlert("交付清单请求失败：" + e.message);
-  } finally {
-    $("btn-delivery").disabled = false;
+    syncDeliveryButtons(); // 失败后按钮恢复可用，允许重新生成
+    return;
   }
+  if (gen !== deliveryGen) return;
+  // 仅当响应仍对应当前审计与当前勾选时才更新列表/结果与下载缓存
+  const currentAid = $("delivery-audit").value;
+  const currentEntries = selectedDeliveryEntries();
+  const sameEntries = entries.length === currentEntries.length &&
+    entries.every((id) => currentEntries.includes(id));
+  if (String(data.audit && data.audit.audit_id) !== String(currentAid) || !sameEntries) return;
+  deliveryManifest = data;
+  deliveryManifestText = JSON.stringify(data, null, 2);
+  renderDeliveryResult(data);
+  deliveryGenerating = false;
+  syncDeliveryButtons();
 });
 $("btn-delivery-download").addEventListener("click", () => {
-  clearDeliveryAlert();
-  const aid = $("delivery-audit").value;
-  if (!aid) { showDeliveryAlert("请先选择一条审计记录。"); return; }
-  const entries = selectedDeliveryEntries();
-  if (!entries.length) { showDeliveryAlert("请至少勾选一个交付入口包。"); return; }
-  window.location.href = deliveryUrl(aid, entries, true);
+  // 下载内容直接取当前界面所示清单（同一成功响应的 JSON 文本），
+  // 与所示清单逐字节一致；按钮本身仅在存在成功清单时可用。
+  if (!deliveryManifest || !deliveryManifestText) return;
+  const aid = deliveryManifest.audit && deliveryManifest.audit.audit_id;
+  const blob = new Blob([deliveryManifestText], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "audit-" + aid + "-delivery.json";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 });
 
 // 自动载入示例，便于首次访问
