@@ -882,15 +882,8 @@ async function loadAuditList() {
     $("btn-edgefix").disabled = true;
   }
   // 交付清单的可选入口包列表随审计选择联动加载
-  if ($("delivery-audit").value) {
-    await loadDeliveryPreview();
-  } else {
-    deliveryPackages = [];
-    $("delivery-entries").innerHTML = "";
-    $("delivery-result").className = "hidden-block";
-    $("btn-delivery").disabled = true;
-    $("btn-delivery-download").disabled = true;
-  }
+  // （空选择同样走 loadDeliveryPreview 的失效与清理逻辑，避免旧清单残留）
+  await loadDeliveryPreview();
   return items;
 }
 
@@ -1715,8 +1708,17 @@ $("btn-graphselect").addEventListener("click", async () => {
 
 // --- 交付清单（入口包闭包，只读） ------------------------------------------------
 
-let deliveryPackages = [];  // 当前审计的可选入口包（预览接口返回）
-let deliveryNodeMap = {};   // 清单内节点 id -> 节点简要（渲染最短路径时标注许可证）
+let deliveryPackages = [];   // 当前审计的可选入口包（预览接口返回）
+let deliveryNodeMap = {};    // 清单内节点 id -> 节点简要（渲染最短路径时标注许可证）
+// 异步串用防护：序号单调递增，只有当前选择下最后一次请求可更新界面；
+// 切换审计 / 重新加载 / 改变入口选择都会开启新一代，使旧清单与旧请求一并失效
+// （A→B→A 也能隔离：两次 A 分属不同代，第一次 A 的迟到响应同样被丢弃）。
+let deliveryLoadSeq = 0;     // 入口列表加载代次
+let deliveryGenSeq = 0;      // 清单生成请求代次
+let deliveryLoading = false;    // 入口列表加载中（期间禁止生成与下载）
+let deliveryGenerating = false; // 清单生成请求进行中
+let deliveryResultKey = null;   // 已展示清单对应的「审计 + 入口集合」键（下载须与其一致）
+let deliveryDownload = null;    // 已展示清单的下载参数快照 {aid, entries}，保证下载内容与所示清单一致
 
 function showDeliveryAlert(msg) {
   const el = $("delivery-alert");
@@ -1725,28 +1727,67 @@ function showDeliveryAlert(msg) {
 }
 function clearDeliveryAlert() { $("delivery-alert").className = "alert"; }
 
-async function loadDeliveryPreview() {
-  clearDeliveryAlert();
+function currentDeliveryKey() {
+  // 当前选择（审计 + 勾选入口集合）的稳定键：判定下载内容是否与所示清单一致
   const aid = $("delivery-audit").value;
+  if (!aid) return null;
+  const entries = selectedDeliveryEntries().slice().sort();
+  if (!entries.length) return null;
+  return aid + "" + entries.join("");
+}
+
+function syncDeliveryButtons() {
+  // 状态联动：加载/生成期间一律禁止生成与下载；
+  // 下载还要求当前选择（审计 + 入口集合）已有成功生成的清单
+  const busy = deliveryLoading || deliveryGenerating;
+  const hasEntries = selectedDeliveryEntries().length > 0;
+  $("btn-delivery").disabled = busy || !hasEntries;
+  $("btn-delivery-download").disabled =
+    busy || !deliveryResultKey || deliveryResultKey !== currentDeliveryKey();
+}
+
+function invalidateDeliveryResult() {
+  // 使旧清单失效：隐藏结果区、清空下载快照（切换审计 / 重新加载 / 改变入口选择时调用）
+  deliveryResultKey = null;
+  deliveryDownload = null;
   $("delivery-result").className = "hidden-block";
   $("delivery-result").innerHTML = "";
-  $("btn-delivery").disabled = true;
-  $("btn-delivery-download").disabled = true;
+}
+
+async function loadDeliveryPreview() {
+  clearDeliveryAlert();
+  // 开启新一代加载：旧清单与进行中的旧请求（含清单生成请求）一并失效
+  const seq = ++deliveryLoadSeq;
+  deliveryGenSeq++;
+  deliveryGenerating = false;
+  invalidateDeliveryResult();
+  deliveryPackages = [];
+  $("delivery-entries").innerHTML = "";
+  const aid = $("delivery-audit").value;
   if (!aid) {
-    $("delivery-entries").innerHTML = "";
+    deliveryLoading = false;
+    syncDeliveryButtons();
     return;
   }
+  deliveryLoading = true;
+  syncDeliveryButtons();  // 入口列表加载期间禁止生成与下载
   let data;
   try {
     const resp = await fetch("/api/audits/" + aid + "/delivery");
     data = await resp.json();
     if (!resp.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
   } catch (e) {
+    if (seq !== deliveryLoadSeq) return;  // 迟到响应：当前选择已变更，丢弃且不动加载状态
+    deliveryLoading = false;
     showDeliveryAlert("加载包列表失败：" + e.message);
+    syncDeliveryButtons();
     return;
   }
+  if (seq !== deliveryLoadSeq) return;  // 迟到响应：不得覆盖新选择的入口列表与按钮状态
+  deliveryLoading = false;
   deliveryPackages = data.packages || [];
   renderDeliveryEntries();
+  syncDeliveryButtons();
 }
 
 function renderDeliveryEntries() {
@@ -1861,9 +1902,11 @@ function renderDeliveryResult(data) {
 $("delivery-audit").addEventListener("change", loadDeliveryPreview);
 $("btn-load-delivery").addEventListener("click", loadDeliveryPreview);
 $("delivery-entries").addEventListener("change", () => {
-  const has = selectedDeliveryEntries().length > 0;
-  $("btn-delivery").disabled = !has;
-  $("btn-delivery-download").disabled = !has;
+  // 改变入口选择：旧清单与进行中的生成请求一并失效，下载随之禁用
+  deliveryGenSeq++;
+  deliveryGenerating = false;
+  invalidateDeliveryResult();
+  syncDeliveryButtons();
 });
 $("btn-delivery").addEventListener("click", async () => {
   clearDeliveryAlert();
@@ -1871,28 +1914,43 @@ $("btn-delivery").addEventListener("click", async () => {
   if (!aid) { showDeliveryAlert("请先选择一条审计记录。"); return; }
   const entries = selectedDeliveryEntries();
   if (!entries.length) { showDeliveryAlert("请至少勾选一个交付入口包。"); return; }
-  $("btn-delivery").disabled = true;
+  // 本次生成独占一代：旧清单失效，进行中的旧请求不得再更新界面或解除加载状态
+  const seq = ++deliveryGenSeq;
+  invalidateDeliveryResult();
+  const key = currentDeliveryKey();
+  deliveryGenerating = true;
+  syncDeliveryButtons();
   try {
     const resp = await fetch(deliveryUrl(aid, entries, false));
     const data = await resp.json();
+    if (seq !== deliveryGenSeq) return;  // 已有更新的选择/请求，丢弃本次结果
     if (!resp.ok) {
+      // 当前请求失败：展示错误并允许重新生成（finally 中恢复按钮）
       showDeliveryAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
       return;
     }
+    deliveryResultKey = key;
+    deliveryDownload = { aid: aid, entries: entries.slice() };
     renderDeliveryResult(data);
   } catch (e) {
+    if (seq !== deliveryGenSeq) return;
     showDeliveryAlert("交付清单请求失败：" + e.message);
   } finally {
-    $("btn-delivery").disabled = false;
+    if (seq === deliveryGenSeq) {  // 仅最后一次请求可解除加载状态
+      deliveryGenerating = false;
+      syncDeliveryButtons();
+    }
   }
 });
 $("btn-delivery-download").addEventListener("click", () => {
   clearDeliveryAlert();
-  const aid = $("delivery-audit").value;
-  if (!aid) { showDeliveryAlert("请先选择一条审计记录。"); return; }
-  const entries = selectedDeliveryEntries();
-  if (!entries.length) { showDeliveryAlert("请至少勾选一个交付入口包。"); return; }
-  window.location.href = deliveryUrl(aid, entries, true);
+  // 仅当前审计与入口已有成功清单时可用；按生成时的快照参数下载，
+  // 保证下载内容与页面所示清单一致
+  if (!deliveryDownload || deliveryResultKey !== currentDeliveryKey()) {
+    showDeliveryAlert("请先为当前审计与入口选择生成清单，再下载。");
+    return;
+  }
+  window.location.href = deliveryUrl(deliveryDownload.aid, deliveryDownload.entries, true);
 });
 
 // 自动载入示例，便于首次访问
